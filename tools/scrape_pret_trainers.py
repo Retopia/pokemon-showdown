@@ -1,41 +1,59 @@
 #!/usr/bin/env python3
 """Scrape trainer parties from pret disassembly repositories.
 
-This script downloads trainer party definitions from a pret project such as
-``pokeemerald`` and converts them into a Pokémon Showdown friendly structure.
-It relies on the textual layout of files like ``src/data/trainer_parties.h``
-which define arrays of ``struct TrainerMon`` values.
-
-Example usage::
-
-    python tools/scrape_pret_trainers.py --trainer ChampionWallace \
-        --source pokeemerald
-
-The resulting JSON is suitable for piping into the Showdown team builder or
-for additional transformation.
+The script can export a single trainer party (matching the original behaviour)
+*or* walk every gym leader, Elite Four member, and champion exposed by the
+configured pret repositories.  The batch mode writes two JSON files per game:
+one containing just the trainer names and another with the full Showdown-ready
+team data.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
-import sys
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Optional
+from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 
 import requests
 
 RAW_BASE = "https://raw.githubusercontent.com/pret"
-DEFAULT_SOURCES = {
-    "pokeemerald": f"{RAW_BASE}/pokeemerald/master/src/data/trainer_parties.h",
-    "pokefirered": f"{RAW_BASE}/pokefirered/master/src/data/trainer_parties.h",
-    "pokelgfr": f"{RAW_BASE}/pokefirered/master/src/data/trainer_parties.h",
-    "pokeblack2": f"{RAW_BASE}/pokeblack2/master/src/data/trainer_parties.h",
-    "pokeplatinum": f"{RAW_BASE}/pokeplatinum/master/src/data/trainer_parties.h",
+STAT_KEYS = ["hp", "atk", "def", "spa", "spd", "spe"]
+
+
+@dataclass
+class PretGame:
+    """Descriptor for a pret repository that exposes trainer data in C headers."""
+
+    key: str
+    repo: str
+    trainers_path: str = "src/data/trainers.h"
+    parties_path: str = "src/data/trainer_parties.h"
+
+    @property
+    def trainers_url(self) -> str:
+        return f"{RAW_BASE}/{self.repo}/master/{self.trainers_path}"
+
+    @property
+    def parties_url(self) -> str:
+        return f"{RAW_BASE}/{self.repo}/master/{self.parties_path}"
+
+
+# Only GBA-era games use the same layout; additional repos can be added later.
+PRET_GAMES: Dict[str, PretGame] = {
+    "rse": PretGame(key="rse", repo="pokeemerald"),
+    "frlg": PretGame(key="frlg", repo="pokefirered"),
 }
 
-STAT_KEYS = ["hp", "atk", "def", "spa", "spd", "spe"]
+DEFAULT_SOURCES: Dict[str, str] = {
+    "pokeemerald": PRET_GAMES["rse"].parties_url,
+    "pokefirered": PRET_GAMES["frlg"].parties_url,
+    "pokelgfr": PRET_GAMES["frlg"].parties_url,
+    "rse": PRET_GAMES["rse"].parties_url,
+    "frlg": PRET_GAMES["frlg"].parties_url,
+}
 
 
 @dataclass
@@ -64,9 +82,17 @@ class TrainerPokemon:
         }
 
 
+@dataclass
+class TrainerMetadata:
+    symbol: str
+    name: str
+    trainer_class: str
+    party_symbol: Optional[str]
+
+
 def normalize_constant(value: str) -> Optional[str]:
     value = value.strip()
-    if not value or value in {"0", "NULL", "NULL", "ITEM_NONE", "MOVE_NONE"}:
+    if not value or value in {"0", "NULL", "ITEM_NONE", "MOVE_NONE"}:
         return None
     for prefix in ("SPECIES_", "ITEM_", "MOVE_", "NATURE_"):
         if value.startswith(prefix):
@@ -156,11 +182,11 @@ def extract_party(source_text: str, trainer_symbol: str) -> List[TrainerPokemon]
     marker = f"sParty_{trainer_symbol}[] = {{"
     try:
         start = source_text.index(marker) + len(marker)
-    except ValueError as exc:  # pragma: no cover - user input driven
+    except ValueError as exc:
         raise ValueError(f"Party 'sParty_{trainer_symbol}' not found in source") from exc
     try:
         end = source_text.index("};", start)
-    except ValueError as exc:  # pragma: no cover - malformed source
+    except ValueError as exc:
         raise ValueError(f"Party 'sParty_{trainer_symbol}' is not terminated with '}};' in source") from exc
     block = source_text[start:end]
     result: List[TrainerPokemon] = []
@@ -201,6 +227,110 @@ def extract_party(source_text: str, trainer_symbol: str) -> List[TrainerPokemon]
     return result
 
 
+def iter_trainer_entries(source_text: str) -> Iterator[Tuple[str, str]]:
+    pattern = re.compile(r"\[([A-Z0-9_]+)\]\s*=\s*\{", re.MULTILINE)
+    pos = 0
+    while True:
+        match = pattern.search(source_text, pos)
+        if not match:
+            break
+        symbol = match.group(1)
+        brace_depth = 1
+        idx = match.end()
+        while idx < len(source_text) and brace_depth:
+            if source_text[idx] == "{":
+                brace_depth += 1
+            elif source_text[idx] == "}":
+                brace_depth -= 1
+            idx += 1
+        entry_text = source_text[match.end() : idx - 1]
+        pos = idx
+        yield symbol, entry_text
+
+
+def parse_trainer_metadata(source_text: str) -> List[TrainerMetadata]:
+    metadata: List[TrainerMetadata] = []
+    for symbol, entry_text in iter_trainer_entries(source_text):
+        trainer_class_match = re.search(r"\.trainerClass\s*=\s*([A-Z0-9_]+)", entry_text)
+        name_match = re.search(r"\.trainerName\s*=\s*_\(([^)]+)\)", entry_text)
+        party_match = re.search(r"sParty_([A-Za-z0-9_]+)", entry_text)
+        trainer_class = trainer_class_match.group(1) if trainer_class_match else ""
+        raw_name = name_match.group(1) if name_match else '""'
+        cleaned_name = raw_name.strip().strip('"')
+        name = cleaned_name.title()
+        metadata.append(
+            TrainerMetadata(
+                symbol=symbol,
+                name=name,
+                trainer_class=trainer_class,
+                party_symbol=party_match.group(1) if party_match else None,
+            )
+        )
+    return metadata
+
+
+def categorize_trainer(trainer_class: str) -> Optional[str]:
+    if "GYM_LEADER" in trainer_class:
+        return "gym_leader"
+    if "ELITE_FOUR" in trainer_class:
+        return "elite_four"
+    if "CHAMPION" in trainer_class or "CHAMP" in trainer_class:
+        return "champion"
+    return None
+
+
+def sanitize_filename(text: str) -> str:
+    return re.sub(r"[^a-z0-9_-]", "-", text.lower())
+
+
+def download_source(identifier: str) -> str:
+    url = DEFAULT_SOURCES.get(identifier, identifier)
+    response = requests.get(url, timeout=30, headers={"User-Agent": "ShowdownTrainerScraper/0.2"})
+    response.raise_for_status()
+    return response.text
+
+
+def run_full_scrape(keys: Sequence[str], output_dir: str, indent: int) -> None:
+    os.makedirs(output_dir, exist_ok=True)
+    for key in keys:
+        if key not in PRET_GAMES:
+            raise ValueError(f"Unknown game '{key}'. Available: {', '.join(sorted(PRET_GAMES))}")
+        spec = PRET_GAMES[key]
+        trainers_src = download_source(spec.trainers_url)
+        parties_src = download_source(spec.parties_url)
+
+        metadata = [entry for entry in parse_trainer_metadata(trainers_src) if categorize_trainer(entry.trainer_class)]
+        summary: Dict[str, List[str]] = {"gym_leader": [], "elite_four": [], "champion": []}
+        detailed: List[Dict[str, object]] = []
+
+        for entry in metadata:
+            category = categorize_trainer(entry.trainer_class)
+            if not category or not entry.party_symbol:
+                continue
+            try:
+                party = extract_party(parties_src, entry.party_symbol)
+            except ValueError:
+                continue
+            summary[category].append(entry.name)
+            detailed.append(
+                {
+                    "trainer": entry.name,
+                    "category": category,
+                    "trainer_symbol": entry.symbol,
+                    "party_symbol": entry.party_symbol,
+                    "pokemon": [mon.to_dict() for mon in party],
+                }
+            )
+
+        base = sanitize_filename(key)
+        summary_path = os.path.join(output_dir, f"{base}-trainers.json")
+        teams_path = os.path.join(output_dir, f"{base}-teams.json")
+        with open(summary_path, "w", encoding="utf-8") as handle:
+            json.dump(summary, handle, indent=indent)
+        with open(teams_path, "w", encoding="utf-8") as handle:
+            json.dump(detailed, handle, indent=indent)
+
+
 def format_showdown(pokemon: List[TrainerPokemon]) -> str:
     lines: List[str] = []
     for mon in pokemon:
@@ -227,19 +357,9 @@ def format_showdown(pokemon: List[TrainerPokemon]) -> str:
     return "\n".join(lines).strip()
 
 
-def download_source(source: str) -> str:
-    if source in DEFAULT_SOURCES:
-        url = DEFAULT_SOURCES[source]
-    else:
-        url = source
-    response = requests.get(url, timeout=30, headers={"User-Agent": "ShowdownTrainerScraper/0.1"})
-    response.raise_for_status()
-    return response.text
-
-
-def main(argv: Optional[List[str]] = None) -> int:
+def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--trainer", required=True, help="Trainer party symbol without the sParty_ prefix")
+    parser.add_argument("--trainer", help="Trainer party symbol without the sParty_ prefix")
     parser.add_argument(
         "--source",
         default="pokeemerald",
@@ -249,10 +369,21 @@ def main(argv: Optional[List[str]] = None) -> int:
         "--format",
         choices=["json", "showdown"],
         default="json",
-        help="Output format",
+        help="Output format for single trainer mode",
     )
     parser.add_argument("--indent", type=int, default=2, help="JSON indentation level")
+    parser.add_argument("--full", action="store_true", help="Scrape every configured game")
+    parser.add_argument("--games", nargs="*", help="Subset of game keys to process in full scrape mode")
+    parser.add_argument("--output-dir", default="trainer-dumps", help="Directory for full scrape output")
     args = parser.parse_args(argv)
+
+    if args.full or args.games:
+        game_keys = args.games if args.games else sorted(PRET_GAMES.keys())
+        run_full_scrape(game_keys, args.output_dir, args.indent)
+        return 0
+
+    if not args.trainer:
+        parser.error("--trainer is required when not running in --full mode")
 
     source_text = download_source(args.source)
     pokemon = extract_party(source_text, args.trainer)
@@ -265,4 +396,4 @@ def main(argv: Optional[List[str]] = None) -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    raise SystemExit(main())
